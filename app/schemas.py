@@ -84,6 +84,40 @@ class PlanCreate(BaseModel):
         return v
 
 
+class SimulationRequest(BaseModel):
+    """What-if constraint patch applied on top of a stored plan.
+
+    The service set is immutable: only the concurrency cap, dependency edges
+    and fault domains may change. Dependencies have no mutable attributes, so
+    "modify" is expressed as remove + add. Fault domains support explicit
+    add (new zone), update (replace the member list of an existing zone) and
+    remove (drop the zone). Nothing is persisted.
+    """
+
+    max_concurrency: int | None = Field(
+        default=None,
+        ge=1,
+        description="If set, replaces the stored per-wave concurrency cap; "
+        "if omitted, the stored cap is kept",
+    )
+    add_dependencies: list[Dependency] = Field(default_factory=list)
+    remove_dependencies: list[Dependency] = Field(default_factory=list)
+    add_fault_domains: list[FaultDomain] = Field(default_factory=list)
+    update_fault_domains: list[FaultDomain] = Field(
+        default_factory=list,
+        description="Replaces the full member list of an existing fault domain",
+    )
+    remove_fault_domains: list[str] = Field(default_factory=list)
+
+    @field_validator("remove_fault_domains")
+    @classmethod
+    def _strip_domain_ids(cls, values: list[str]) -> list[str]:
+        cleaned = [s.strip() for s in values]
+        if any(not s for s in cleaned):
+            raise ValueError("domain id must not be blank")
+        return cleaned
+
+
 # ---- Response models -------------------------------------------------------
 
 
@@ -137,6 +171,46 @@ class PlanList(BaseModel):
 class PlanDeleted(BaseModel):
     id: int
     deleted: bool = True
+
+
+# ---- Simulation models -----------------------------------------------------
+
+
+class ServiceWaveChange(BaseModel):
+    service: str
+    original_wave: int
+    new_wave: int
+
+
+class SimulationResult(BaseModel):
+    plan_id: int
+    waves: list[Wave]
+    wave_count: int
+    original_wave_count: int
+    waves_delta: int = Field(
+        ...,
+        description="new wave count minus original wave count (negative means "
+        "the simulated plan uses fewer waves)",
+    )
+    waves_added: int = Field(..., description="max(waves_delta, 0)")
+    waves_removed: int = Field(..., description="max(-waves_delta, 0)")
+    changed_services: list[ServiceWaveChange] = Field(
+        ...,
+        description="Per-service original/new wave for every service assigned "
+        "to a different wave, sorted by service id",
+    )
+    changed_service_count: int
+    affected_services: list[str] = Field(
+        ...,
+        description="Sorted services directly violated by the *added* "
+        "constraints in the original plan: endpoints of an added dependency "
+        "whose original waves do not satisfy the new ordering, and members of "
+        "an added/updated fault domain that originally shared a wave",
+    )
+    max_concurrency: int = Field(
+        ..., description="Concurrency cap actually applied in the simulation"
+    )
+    optimal: bool
 
 
 # ---- Error envelope --------------------------------------------------------

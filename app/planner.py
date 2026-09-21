@@ -24,7 +24,7 @@ from ortools.sat.python import cp_model
 from .config import Settings
 from .errors import PlanningError
 from .graph import build_adjacency, find_cycles, longest_path_length
-from .schemas import Issue, PlanCreate
+from .schemas import Issue, PlanCreate, SimulationRequest
 
 FEASIBLE_STATUSES = (cp_model.OPTIMAL, cp_model.FEASIBLE)
 
@@ -34,6 +34,16 @@ class PlanOutput:
     waves: list[list[str]]  # services of each wave, sorted
     wave_count: int
     optimal: bool
+
+
+@dataclass
+class SimulationOutput:
+    waves: list[list[str]]  # services of each wave, sorted
+    wave_count: int
+    assignment: dict[str, int]
+    optimal: bool
+    concurrency: int
+    affected_services: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +309,117 @@ def _to_output(result: _SolveResult) -> PlanOutput:
 
 
 # ---------------------------------------------------------------------------
+# Simulation solver: lexicographic optimization
+#   1. minimum waves
+#   2. among minimum-wave schedules, minimum number of moved services
+#   3. canonical placement (lexicographically late ids pushed later)
+#
+# Every lexicographic step fixes the previous objective to its proven optimum
+# via an equality constraint (not a weighted sum), so the tie-break can never
+# trade away a better primary objective. Fixed seed + one worker keeps the
+# whole pipeline deterministic.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SimSolveResult:
+    feasible: bool
+    optimal: bool
+    wave_count: int
+    assignment: dict[str, int]
+
+
+def _tie_break_budget(settings: Settings) -> float:
+    return min(3.0, max(0.5, settings.solver_time_limit_seconds / 2))
+
+
+def _solve_simulation(
+    services: list[str],
+    edges: list[tuple[str, str]],
+    fault_cliques: list[list[str]],
+    concurrency: int,
+    original_assignment: dict[str, int],
+    settings: Settings,
+) -> _SimSolveResult:
+    n = len(services)
+
+    # Phase 1: minimum number of waves.
+    model, pos, max_pos = _build_wave_model(
+        services, edges, fault_cliques, n, concurrency
+    )
+    model.Minimize(max_pos)
+    solver = _make_solver(settings)
+    status = solver.Solve(model)
+    if status not in FEASIBLE_STATUSES:
+        # Defensive: with horizon == n, waves of size 1 always work for DAGs.
+        return _SimSolveResult(False, False, 0, {})
+
+    wave_count = int(solver.Value(max_pos)) + 1
+    assignment = {s: int(solver.Value(pos[s])) for s in services}
+    optimal = status == cp_model.OPTIMAL
+
+    if not optimal:
+        return _SimSolveResult(True, False, wave_count, assignment)
+
+    def _hint(m: cp_model.CpModel, p: dict, mp, known: dict, wcount: int) -> None:
+        m.AddHint(mp, wcount - 1)
+        for s, w in known.items():
+            m.AddHint(p[s], w)
+
+    # Phase 2: within the proven minimum, minimize moved services. A service
+    # is "moved" iff its new wave differs from its wave in the stored plan.
+    model2, pos2, max_pos2 = _build_wave_model(
+        services, edges, fault_cliques, n, concurrency
+    )
+    model2.Add(max_pos2 == wave_count - 1)
+    moved_var: dict[str, cp_model.IntVar] = {}
+    for s in services:
+        m = model2.NewBoolVar(f"moved_{s}")
+        orig = original_assignment[s]
+        model2.Add(pos2[s] == orig).OnlyEnforceIf(m.Not())
+        model2.Add(pos2[s] != orig).OnlyEnforceIf(m)
+        moved_var[s] = m
+    total_moved = model2.NewIntVar(0, len(services), "total_moved")
+    model2.Add(total_moved == sum(moved_var.values()))
+    model2.Minimize(total_moved)
+    _hint(model2, pos2, max_pos2, assignment, wave_count)
+    solver2 = _make_solver(settings, time_limit=_tie_break_budget(settings))
+    status2 = solver2.Solve(model2)
+
+    min_moved: int | None = None
+    if status2 in FEASIBLE_STATUSES:
+        assignment = {s: int(solver2.Value(pos2[s])) for s in services}
+        if status2 == cp_model.OPTIMAL:
+            min_moved = int(solver2.Value(total_moved))
+        optimal = status2 == cp_model.OPTIMAL
+
+    # Phase 3: among minimum-move schedules, canonicalize positions the same
+    # way the regular planner does, so identical simulations are identical.
+    if min_moved is not None:
+        model3, pos3, max_pos3 = _build_wave_model(
+            services, edges, fault_cliques, n, concurrency
+        )
+        model3.Add(max_pos3 == wave_count - 1)
+        moved3: list[cp_model.IntVar] = []
+        for s in services:
+            m = model3.NewBoolVar(f"moved3_{s}")
+            orig = original_assignment[s]
+            model3.Add(pos3[s] == orig).OnlyEnforceIf(m.Not())
+            model3.Add(pos3[s] != orig).OnlyEnforceIf(m)
+            moved3.append(m)
+        model3.Add(sum(moved3) == min_moved)
+        ranked = {s: rank for rank, s in enumerate(sorted(services))}
+        model3.Maximize(sum(ranked[s] * pos3[s] for s in services))
+        _hint(model3, pos3, max_pos3, assignment, wave_count)
+        solver3 = _make_solver(settings, time_limit=_tie_break_budget(settings))
+        status3 = solver3.Solve(model3)
+        if status3 in FEASIBLE_STATUSES:
+            assignment = {s: int(solver3.Value(pos3[s])) for s in services}
+
+    return _SimSolveResult(True, optimal, wave_count, assignment)
+
+
+# ---------------------------------------------------------------------------
 # Infeasibility diagnostics
 # ---------------------------------------------------------------------------
 
@@ -508,3 +629,432 @@ def plan_release(req: PlanCreate, settings: Settings) -> tuple[PlanOutput, list[
 
     # Defensive: with horizon == n, waves of size 1 always work for DAGs.
     raise RuntimeError("Unexpected solver infeasibility without a wave window cap")
+
+
+# ---------------------------------------------------------------------------
+# Constraint-change simulation (never persisted by the planning layer)
+# ---------------------------------------------------------------------------
+
+
+def _patch_error(code: str, message: str, constraint: str, **kw: object) -> Issue:
+    return Issue(code=code, message=message, constraint=constraint, **kw)
+
+
+def _apply_simulation_patch(
+    services: list[str],
+    base_edges: list[tuple[str, str]],
+    base_domains: list[dict],
+    patch: SimulationRequest,
+) -> tuple[
+    list[tuple[str, str]],
+    list[dict],
+    list[list[str]],
+    set[tuple[str, str]],
+    dict[str, list[str]],
+]:
+    """Validate the patch against the stored plan and compute the new inputs.
+
+    Returns (new_edges, new_domains, new_fault_cliques, added_edges,
+    added_domain_members), where the last two describe what the patch
+    *introduced* (used for affected-service computation).
+    """
+    known = set(services)
+    issues: list[Issue] = []
+
+    # --- Dependencies -------------------------------------------------------
+    new_edges = set(base_edges)
+    added_edges: set[tuple[str, str]] = set()
+    seen_add: set[tuple[str, str]] = set()
+    seen_remove: set[tuple[str, str]] = set()
+    effective_adds: set[tuple[str, str]] = set()
+
+    for dep in patch.add_dependencies:
+        edge = (dep.service, dep.depends_on)
+        if edge in seen_add:
+            continue
+        seen_add.add(edge)
+        for endpoint, other, code in (
+            (dep.service, dep.depends_on, "simulation_unknown_dependency_service"),
+            (dep.depends_on, dep.service, "simulation_unknown_dependency_target"),
+        ):
+            if endpoint not in known:
+                issues.append(
+                    _patch_error(
+                        code,
+                        (
+                            f"Added dependency references '{endpoint}', which "
+                            "is not part of this plan's service list (a "
+                            "simulation cannot create services)."
+                        ),
+                        "add_dependencies",
+                        service=endpoint,
+                        related_services=[other],
+                    )
+                )
+        if dep.service not in known or dep.depends_on not in known:
+            continue
+        if edge in new_edges:
+            issues.append(
+                _patch_error(
+                    "simulation_dependency_exists",
+                    (
+                        f"Dependency '{dep.service}' -> '{dep.depends_on}' "
+                        "already exists in the stored plan; remove it first "
+                        "or drop the addition."
+                    ),
+                    "add_dependencies",
+                    service=dep.service,
+                    related_services=[dep.depends_on],
+                )
+            )
+        else:
+            new_edges.add(edge)
+            added_edges.add(edge)
+            effective_adds.add(edge)
+
+    for dep in patch.remove_dependencies:
+        edge = (dep.service, dep.depends_on)
+        if edge in seen_remove:
+            continue
+        seen_remove.add(edge)
+        if edge in effective_adds:
+            issues.append(
+                _patch_error(
+                    "simulation_dependency_conflicting_ops",
+                    (
+                        f"Dependency '{dep.service}' -> '{dep.depends_on}' is "
+                        "both added and removed in the same simulation."
+                    ),
+                    "remove_dependencies",
+                    service=dep.service,
+                    related_services=[dep.depends_on],
+                )
+            )
+        if dep.service not in known or dep.depends_on not in known:
+            issues.append(
+                _patch_error(
+                    "simulation_removed_dependency_unknown",
+                    (
+                        f"Removed dependency references '{dep.service}' / "
+                        f"'{dep.depends_on}', which are not both part of this "
+                        "plan's service list."
+                    ),
+                    "remove_dependencies",
+                    service=dep.service,
+                    related_services=[dep.depends_on],
+                )
+            )
+        elif edge not in base_edges:
+            issues.append(
+                _patch_error(
+                    "simulation_dependency_not_found",
+                    (
+                        f"Dependency '{dep.service}' -> '{dep.depends_on}' does "
+                        "not exist in the stored plan and cannot be removed."
+                    ),
+                    "remove_dependencies",
+                    service=dep.service,
+                    related_services=[dep.depends_on],
+                )
+            )
+        else:
+            new_edges.discard(edge)
+
+    # --- Fault domains ------------------------------------------------------
+    domains_by_name: dict[str, list[str]] = {
+        d["domain"]: list(d["services"]) for d in base_domains
+    }
+    new_domains: list[dict] = []
+    # domain -> members introduced by the patch (sorted input lists)
+    added_domain_members: dict[str, list[str]] = {}
+
+    def _check_domain_members(
+        section: str, domain: str, members: list[str]
+    ) -> None:
+        for m in members:
+            if m not in known:
+                issues.append(
+                    _patch_error(
+                        "simulation_unknown_fault_domain_member",
+                        (
+                            f"Fault domain change for '{domain}' references "
+                            f"unknown service '{m}'."
+                        ),
+                        section,
+                        service=m,
+                        context={"domain": domain},
+                    )
+                )
+
+    seen_add_domains: set[str] = set()
+    effective_add_domains: set[str] = set()
+    for fd in patch.add_fault_domains:
+        if fd.domain in seen_add_domains:
+            issues.append(
+                _patch_error(
+                    "simulation_duplicate_fault_domain_op",
+                    f"Fault domain '{fd.domain}' is added more than once.",
+                    "add_fault_domains",
+                    context={"domain": fd.domain},
+                )
+            )
+            continue
+        seen_add_domains.add(fd.domain)
+        _check_domain_members("add_fault_domains", fd.domain, fd.services)
+        if fd.domain in domains_by_name:
+            issues.append(
+                _patch_error(
+                    "simulation_fault_domain_exists",
+                    (
+                        f"Fault domain '{fd.domain}' already exists in the "
+                        "stored plan; use update_fault_domains to replace its "
+                        "members or remove_fault_domains to drop it."
+                    ),
+                    "add_fault_domains",
+                    context={"domain": fd.domain},
+                )
+            )
+            continue
+        members = sorted(set(fd.services))
+        domains_by_name[fd.domain] = members
+        added_domain_members[fd.domain] = members
+        effective_add_domains.add(fd.domain)
+
+    seen_update_domains: set[str] = set()
+    for fd in patch.update_fault_domains:
+        if fd.domain in seen_update_domains:
+            issues.append(
+                _patch_error(
+                    "simulation_duplicate_fault_domain_op",
+                    f"Fault domain '{fd.domain}' is updated more than once.",
+                    "update_fault_domains",
+                    context={"domain": fd.domain},
+                )
+            )
+            continue
+        seen_update_domains.add(fd.domain)
+        _check_domain_members("update_fault_domains", fd.domain, fd.services)
+        if fd.domain in effective_add_domains:
+            issues.append(
+                _patch_error(
+                    "simulation_fault_domain_conflicting_ops",
+                    (
+                        f"Fault domain '{fd.domain}' is both added and updated "
+                        "in the same simulation."
+                    ),
+                    "update_fault_domains",
+                    context={"domain": fd.domain},
+                )
+            )
+            continue
+        if fd.domain not in domains_by_name:
+            issues.append(
+                _patch_error(
+                    "simulation_fault_domain_not_found",
+                    (
+                        f"Fault domain '{fd.domain}' does not exist in the "
+                        "stored plan and cannot be updated; add it instead."
+                    ),
+                    "update_fault_domains",
+                    context={"domain": fd.domain},
+                )
+            )
+            continue
+        old_members = set(domains_by_name[fd.domain])
+        members = sorted(set(fd.services))
+        domains_by_name[fd.domain] = members
+        added_domain_members[fd.domain] = sorted(set(members) - old_members)
+
+    seen_remove_domains: set[str] = set()
+    for name in patch.remove_fault_domains:
+        if name in seen_remove_domains:
+            issues.append(
+                _patch_error(
+                    "simulation_duplicate_fault_domain_op",
+                    f"Fault domain '{name}' is removed more than once.",
+                    "remove_fault_domains",
+                    context={"domain": name},
+                )
+            )
+            continue
+        seen_remove_domains.add(name)
+        if name in effective_add_domains:
+            issues.append(
+                _patch_error(
+                    "simulation_fault_domain_conflicting_ops",
+                    (
+                        f"Fault domain '{name}' is both added and removed in "
+                        "the same simulation."
+                    ),
+                    "remove_fault_domains",
+                    context={"domain": name},
+                )
+            )
+            continue
+        if name not in domains_by_name:
+            issues.append(
+                _patch_error(
+                    "simulation_fault_domain_not_found",
+                    (
+                        f"Fault domain '{name}' does not exist in the stored "
+                        "plan and cannot be removed."
+                    ),
+                    "remove_fault_domains",
+                    context={"domain": name},
+                )
+            )
+            continue
+        domains_by_name.pop(name)
+        added_domain_members.pop(name, None)
+
+    if issues:
+        raise PlanningError(
+            "The simulation patch is invalid for this plan.", issues
+        )
+
+    for name in sorted(domains_by_name):
+        new_domains.append(
+            {"domain": name, "services": list(domains_by_name[name])}
+        )
+    new_fault_cliques = [
+        members for members in domains_by_name.values() if len(members) >= 2
+    ]
+    return (
+        sorted(new_edges),
+        new_domains,
+        new_fault_cliques,
+        added_edges,
+        added_domain_members,
+    )
+
+
+def _simulation_cycle_issue(
+    cycles: list[list[str]],
+    added_edges: set[tuple[str, str]],
+) -> Issue:
+    """Cycle diagnostic, annotated with which closing edges the patch adds."""
+    cycle = cycles[0]
+    closing_edges = [
+        [cycle[i], cycle[(i + 1) % len(cycle)]] for i in range(len(cycle))
+    ]
+    introduced = [
+        edge
+        for edge in closing_edges
+        if (edge[0], edge[1]) in added_edges
+    ]
+    return Issue(
+        code="dependency_cycle",
+        message=(
+            f"The simulated constraints contain {len(cycles)} dependency "
+            "cycle(s); no release order exists. First cycle: "
+            f"{_format_cycle(cycle)}"
+        ),
+        constraint="add_dependencies" if introduced else "dependencies",
+        service=cycle[0],
+        related_services=cycle,
+        context={
+            "cycles": cycles,
+            "cycle_count": len(cycles),
+            "added_edges_in_cycle": introduced,
+        },
+    )
+
+
+def simulate_plan_change(
+    base_request: PlanCreate,
+    base_waves: list[list[str]],
+    patch: SimulationRequest,
+    settings: Settings,
+) -> SimulationOutput:
+    """Re-plan a stored plan under a constraint patch, without persisting.
+
+    The service set comes from the stored (already validated) request; the
+    stored ``max_waves`` window is intentionally ignored — a simulation is
+    always solved against the unconstrained horizon so the minimum-wave
+    optimum under the new constraints can be reported.
+    """
+    services = list(dict.fromkeys(base_request.services))
+    base_edges = list(
+        dict.fromkeys((d.service, d.depends_on) for d in base_request.dependencies)
+    )
+    base_domains = [
+        {"domain": fd.domain, "services": sorted(set(fd.services))}
+        for fd in base_request.fault_domains
+    ]
+
+    (
+        new_edges,
+        new_domains,
+        fault_cliques,
+        added_edges,
+        added_domain_members,
+    ) = _apply_simulation_patch(services, base_edges, base_domains, patch)
+
+    concurrency = (
+        patch.max_concurrency
+        if patch.max_concurrency is not None
+        else base_request.max_concurrency
+    )
+
+    adj = build_adjacency(services, new_edges)
+    cycles = find_cycles(services, adj, settings.max_reported_cycles)
+    if cycles:
+        raise PlanningError(
+            "The simulated dependency graph contains a cycle.",
+            [_simulation_cycle_issue(cycles, added_edges)],
+        )
+
+    # Original placement, derived from the stored wave member lists.
+    original_assignment: dict[str, int] = {
+        s: i for i, members in enumerate(base_waves) for s in members
+    }
+    # Defensive fallback if the stored result is ever short on members.
+    for s in services:
+        original_assignment.setdefault(s, 0)
+
+    # Services the *added* constraints directly violate in the original plan.
+    affected: set[str] = set()
+    for a, b in added_edges:
+        if original_assignment[a] <= original_assignment[b]:
+            affected.add(a)
+            affected.add(b)
+    new_membership = {d["domain"]: d["services"] for d in new_domains}
+    for domain, added_members in added_domain_members.items():
+        # A pair is newly anti-affine iff at least one endpoint was added to
+        # the domain; compare each added member against the full new list.
+        full_members = new_membership.get(domain, [])
+        for member in added_members:
+            for other in full_members:
+                if (
+                    other != member
+                    and original_assignment[member]
+                    == original_assignment[other]
+                ):
+                    affected.add(member)
+                    affected.add(other)
+
+    result = _solve_simulation(
+        services,
+        new_edges,
+        fault_cliques,
+        concurrency,
+        original_assignment,
+        settings,
+    )
+    if not result.feasible:
+        # Defensive: with horizon == n, waves of size 1 always work for DAGs.
+        raise RuntimeError("Unexpected simulator infeasibility")
+
+    groups: dict[int, list[str]] = {}
+    for s, w in result.assignment.items():
+        groups.setdefault(w, []).append(s)
+    waves = [sorted(groups[old]) for old in sorted(groups)]
+
+    return SimulationOutput(
+        waves=waves,
+        wave_count=len(waves),
+        assignment=result.assignment,
+        optimal=result.optimal,
+        concurrency=concurrency,
+        affected_services=sorted(affected),
+    )

@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from . import db
 from .config import Settings, load_settings
 from .errors import PlanningError
-from .planner import plan_release
+from .planner import plan_release, simulate_plan_change
 from .schemas import (
     ErrorBody,
     Issue,
@@ -21,6 +21,9 @@ from .schemas import (
     PlanList,
     PlanResult,
     PlanSummary,
+    ServiceWaveChange,
+    SimulationRequest,
+    SimulationResult,
     Wave,
 )
 
@@ -51,6 +54,50 @@ app.state.settings = load_settings()
 # ---------------------------------------------------------------------------
 
 
+def _ident(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _locate_ident(
+    loc: list[str], body: dict, leaf_input: object
+) -> str | None:
+    """Best-effort extraction of the offending service/domain id.
+
+    For dependency/fault-domain entries the field name itself ("service",
+    "domain") is useless, so walk the request body along the error location
+    and prefer the id carried by the offending object; fall back to a scalar
+    leaf in the path (e.g. a raw services array entry).
+    """
+    if isinstance(leaf_input, dict):
+        for key in ("service", "depends_on", "domain"):
+            value = _ident(leaf_input.get(key))
+            if value:
+                return value
+    direct = _ident(leaf_input)
+    if direct:
+        return direct
+
+    node: object = body
+    for part in loc:
+        if isinstance(node, dict):
+            node = node.get(part)
+        elif isinstance(node, list) and part.isdigit():
+            idx = int(part)
+            node = node[idx] if 0 <= idx < len(node) else None
+        else:
+            node = None
+        if isinstance(node, dict):
+            for key in ("service", "depends_on", "domain"):
+                value = _ident(node.get(key))
+                if value:
+                    return value
+        else:
+            value = _ident(node)
+            if value:
+                return value
+    return None
+
+
 @app.exception_handler(PlanningError)
 async def planning_error_handler(request: Request, exc: PlanningError) -> JSONResponse:
     body = ErrorBody(
@@ -68,11 +115,22 @@ async def request_validation_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
     issues: list[Issue] = []
+    constraint_sections = (
+        "services",
+        "dependencies",
+        "fault_domains",
+        "add_dependencies",
+        "remove_dependencies",
+        "add_fault_domains",
+        "update_fault_domains",
+        "remove_fault_domains",
+    )
+    body = exc.body if isinstance(exc.body, dict) else {}
     for err in exc.errors():
         loc = [str(p) for p in err.get("loc", []) if p not in ("body",)]
         service = None
-        if loc and loc[0] in ("services", "dependencies", "fault_domains"):
-            service = loc[-1] if loc[-1].isidentifier() or "-" in loc[-1] else None
+        if loc and loc[0] in constraint_sections:
+            service = _locate_ident(loc, body, err.get("input"))
         issues.append(
             Issue(
                 code="invalid_request_field",
@@ -242,3 +300,72 @@ def delete_plan(
         ).model_dump()
         return JSONResponse(status_code=404, content=body)  # type: ignore[return-value]
     return PlanDeleted(id=plan_id)
+
+
+@app.post(
+    "/plans/{plan_id}/simulate",
+    response_model=SimulationResult,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def simulate_plan(
+    plan_id: int,
+    patch: SimulationRequest,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> SimulationResult:
+    settings: Settings = app.state.settings
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        body = ErrorBody(
+            error="not_found",
+            message=f"Plan {plan_id} does not exist.",
+            issues=[
+                Issue(
+                    code="plan_not_found",
+                    message=f"Plan {plan_id} does not exist.",
+                    constraint="plan_id",
+                    context={"id": plan_id},
+                )
+            ],
+        ).model_dump()
+        return JSONResponse(status_code=404, content=body)  # type: ignore[return-value]
+
+    request_json = json.loads(row["request_json"])
+    result_json = json.loads(row["result_json"])
+    base_request = PlanCreate(**request_json)
+    base_waves = [w["services"] for w in result_json["waves"]]
+
+    sim = simulate_plan_change(base_request, base_waves, patch, settings)
+    original_wave_count = row["wave_count"]
+
+    original_wave_of = {
+        s: i + 1 for i, members in enumerate(base_waves) for s in members
+    }
+    changed = [
+        ServiceWaveChange(
+            service=s,
+            original_wave=original_wave_of.get(s, 0),
+            new_wave=sim.assignment[s] + 1,
+        )
+        for s in sorted(sim.assignment)
+        if sim.assignment[s] + 1 != original_wave_of.get(s)
+    ]
+    delta = sim.wave_count - original_wave_count
+
+    return SimulationResult(
+        plan_id=plan_id,
+        waves=[
+            Wave(index=i + 1, services=members)
+            for i, members in enumerate(sim.waves)
+        ],
+        wave_count=sim.wave_count,
+        original_wave_count=original_wave_count,
+        waves_delta=delta,
+        waves_added=max(delta, 0),
+        waves_removed=max(-delta, 0),
+        changed_services=changed,
+        changed_service_count=len(changed),
+        affected_services=sim.affected_services,
+        max_concurrency=sim.concurrency,
+        optimal=sim.optimal,
+    )

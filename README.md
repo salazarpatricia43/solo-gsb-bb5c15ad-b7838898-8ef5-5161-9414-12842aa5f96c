@@ -82,6 +82,78 @@ curl -X POST http://localhost:8000/plans \
 `optimal=true` 表示求解器证明了波次最少；`false` 仅在触发求解时间上限时出现
 （此时方案仍可行但不保证最优）。
 
+## 约束变更影响模拟（不落库）
+
+`POST /plans/{id}/simulate` 在**已保存方案**上叠加一组约束补丁，重新求最优方案，
+**不写数据库**、不创建记录、不影响原方案。服务集合不可变（模拟不能新增/删除
+服务），可变更的只有并发上限、依赖边与故障域：
+
+```bash
+curl -X POST http://localhost:8000/plans/1/simulate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "max_concurrency": 1,
+    "add_dependencies":    [{"service": "web", "depends_on": "cache"}],
+    "remove_dependencies": [{"service": "auth", "depends_on": "db"}],
+    "add_fault_domains":    [{"domain": "az-b", "services": ["api", "web"]}],
+    "update_fault_domains": [{"domain": "az-a", "services": ["db"]}],
+    "remove_fault_domains": ["az-old"]
+  }'
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `max_concurrency` | 传入即**覆盖**原并发上限；省略则沿用原值（依赖/故障域没有「取消」语义，只能增删） |
+| `add_dependencies` | 新增依赖边；边在原方案中已存在则 422（依赖不可「改」，改 = 先删后增，可同一请求完成） |
+| `remove_dependencies` | 删除依赖边；原方案中不存在则 422 |
+| `add_fault_domains` | 新增故障域（新域名）；同名域已存在则 422 |
+| `update_fault_domains` | **整体替换**某已有域的成员列表（成员增删都用它） |
+| `remove_fault_domains` | 按域名删除整个故障域 |
+
+所有字段均可省略，空对象 `{}` 表示「无变更」，返回应与原方案完全一致。同一补丁中
+对同一条边/同一个域执行互斥操作（又增又删等）会返回带定位的 422。
+
+**优化目标（字典序，逐级固定）**：① 波次最少；② 在波次相同的最优方案中，
+**换波服务数最少**（仅统计新方案与原方案波次不同的服务）；③ 规范化服务摆放位置。
+固定随机种子 + 单线程保证相同补丁永远得到相同结果。模拟总是在无窗口上限下求解
+（忽略原方案的 `max_waves`），因此能算出新约束下真正的最少波次。
+
+响应同时给出新波次、波次数增减、逐服务原/新波次，以及被**新增约束直接影响**的
+服务 `affected_services`（即在原方案摆放位置下，新增约束就已经被违反的服务；
+调整并发上限不点名任何服务，删约束也不会直接违反原摆放）：
+
+```json
+{
+  "plan_id": 1,
+  "waves": [
+    {"index": 1, "services": ["a", "c"]},
+    {"index": 2, "services": ["b", "d"]}
+  ],
+  "wave_count": 2,
+  "original_wave_count": 2,
+  "waves_delta": 0,
+  "waves_added": 0,
+  "waves_removed": 0,
+  "changed_services": [
+    {"service": "b", "original_wave": 1, "new_wave": 2},
+    {"service": "c", "original_wave": 2, "new_wave": 1}
+  ],
+  "changed_service_count": 2,
+  "affected_services": ["c", "d"],
+  "max_concurrency": 2,
+  "optimal": true
+}
+```
+
+- `waves_delta = wave_count - original_wave_count`（负数表示波次变少）；
+  `waves_added` / `waves_removed` 为其非负两侧。
+- `changed_services` 只包含真正换波的服务，按服务 id 排序；波次按 1 起编号。
+- 新增依赖 `x -> y`：若原方案中 x 不晚于 y（不满足「y 更早」），则 x、y 都进入
+  `affected_services`；新增/扩容故障域时，原同波且新落入同一域的一对成员都计入。
+- 补丁导致依赖成环、引用未知服务、操作矛盾或目标不存在时，返回结构化 422/404
+  （见下表）。环问题的 issue 上下文 `added_edges_in_cycle` 标出环上哪些边是本次
+  补丁引入的。
+
 ## 错误结构（422）
 
 所有失败使用统一信封 `error + message + issues[]`，每个 issue 可定位：
@@ -113,6 +185,17 @@ curl -X POST http://localhost:8000/plans \
 | `fault_domain_anti_affinity` | 故障域反亲和所需的最少波次超过 `max_waves` |
 | `release_window_infeasible` | 组合约束下窗口不可行，附无窗口时所需的确切波次 |
 | `invalid_request_field` | JSON/Schema 校验失败，附带字段位置 |
+| `simulation_unknown_dependency_service` / `simulation_unknown_dependency_target` | 模拟新增依赖引用了方案外的服务（模拟不能创建服务） |
+| `simulation_removed_dependency_unknown` | 模拟删除依赖时引用了方案外的服务 |
+| `simulation_dependency_exists` / `simulation_dependency_not_found` | 新增的边已存在 / 删除的边不存在 |
+| `simulation_dependency_conflicting_ops` | 同一条边在补丁中既新增又删除 |
+| `simulation_unknown_fault_domain_member` | 故障域增改引用了方案外的服务 |
+| `simulation_fault_domain_exists` / `simulation_fault_domain_not_found` | 新增的域已存在 / 更新或删除的域不存在 |
+| `simulation_fault_domain_conflicting_ops` / `simulation_duplicate_fault_domain_op` | 同一域互斥操作 / 同一操作重复 |
+
+> 模拟不会因「波次不够」而失败：它不受原 `max_waves` 窗口限制，始终求新约束下的
+> 最少波次；真正不可行的来源只有补丁非法（上述 `simulation_*`）或补丁引入依赖环
+> （`dependency_cycle`）。
 
 ## API 一览
 
@@ -122,6 +205,7 @@ curl -X POST http://localhost:8000/plans \
 | GET | `/plans?limit=50&offset=0` | 方案列表（按 id 倒序分页） |
 | GET | `/plans/{id}` | 查询单个方案（含完整波次与原始约束） |
 | DELETE | `/plans/{id}` | 删除方案，成功 200，不存在 404 |
+| POST | `/plans/{id}/simulate` | 约束变更影响模拟，不落库；成功 200，方案不存在 404，补丁不可行 422 |
 | GET | `/health` | 健康检查 |
 
 ## 必要配置（环境变量，均有默认值）
@@ -159,7 +243,7 @@ app/
   schemas.py    # 请求/响应模型与错误结构
   errors.py     # 结构化规划异常
   graph.py      # 依赖图：环检测（Tarjan SCC）、关键路径
-  planner.py    # CP-SAT 建模、两阶段求解、不可行诊断
+  planner.py    # CP-SAT 建模、两阶段求解、不可行诊断、约束变更模拟（三阶段字典序优化）
   db.py         # SQLite 初始化与 CRUD
   main.py       # FastAPI 路由、启动建表、异常处理
 tests/          # 端到端测试（规划/错误定位/CRUD/确定性）
