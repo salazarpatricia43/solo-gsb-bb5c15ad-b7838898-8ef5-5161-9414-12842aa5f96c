@@ -13,6 +13,12 @@ Determinism: fixed random seed and a single search worker; a second solve
 phase then canonicalizes service positions within the proven minimum number
 of waves, and wave member lists are sorted. Repeated identical requests
 yield identical plans.
+
+What-if simulation (``simulate_plan``) merges constraint changes into a
+stored request without persisting anything, then solves a lexicographic
+objective — fewest waves first, then fewest services moved relative to the
+stored plan — encoded as one scaled linear objective, followed by the same
+canonicalization pass for determinism.
 """
 from __future__ import annotations
 
@@ -24,7 +30,7 @@ from ortools.sat.python import cp_model
 from .config import Settings
 from .errors import PlanningError
 from .graph import build_adjacency, find_cycles, longest_path_length
-from .schemas import Issue, PlanCreate
+from .schemas import Dependency, FaultDomain, Issue, PlanCreate, PlanSimulate
 
 FEASIBLE_STATUSES = (cp_model.OPTIMAL, cp_model.FEASIBLE)
 
@@ -332,6 +338,24 @@ def _format_cycle(cycle: list[str]) -> str:
     return " -> ".join(cycle + [cycle[0]])
 
 
+def _cycle_error(cycles: list[list[str]]) -> PlanningError:
+    issues = [
+        Issue(
+            code="dependency_cycle",
+            message=(
+                f"Dependency graph contains {len(cycles)} cycle(s); "
+                "a release order cannot be determined. First cycle: "
+                f"{_format_cycle(cycles[0])}"
+            ),
+            constraint="dependencies",
+            service=cycles[0][0],
+            related_services=cycles[0],
+            context={"cycles": cycles, "cycle_count": len(cycles)},
+        )
+    ]
+    return PlanningError("The dependency graph contains a cycle.", issues)
+
+
 def _diagnose_window(
     services: list[str],
     edges: list[tuple[str, str]],
@@ -461,21 +485,7 @@ def plan_release(req: PlanCreate, settings: Settings) -> tuple[PlanOutput, list[
     adj = build_adjacency(services, edges)
     cycles = find_cycles(services, adj, settings.max_reported_cycles)
     if cycles:
-        issues = [
-            Issue(
-                code="dependency_cycle",
-                message=(
-                    f"Dependency graph contains {len(cycles)} cycle(s); "
-                    "a release order cannot be determined. First cycle: "
-                    f"{_format_cycle(cycles[0])}"
-                ),
-                constraint="dependencies",
-                service=cycles[0][0],
-                related_services=cycles[0],
-                context={"cycles": cycles, "cycle_count": len(cycles)},
-            )
-        ]
-        raise PlanningError("The dependency graph contains a cycle.", issues)
+        raise _cycle_error(cycles)
 
     horizon = min(len(services), req.max_waves) if req.max_waves else len(services)
     result = _solve(
@@ -508,3 +518,228 @@ def plan_release(req: PlanCreate, settings: Settings) -> tuple[PlanOutput, list[
 
     # Defensive: with horizon == n, waves of size 1 always work for DAGs.
     raise RuntimeError("Unexpected solver infeasibility without a wave window cap")
+
+
+# ---------------------------------------------------------------------------
+# What-if simulation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SimulationOutput:
+    waves: list[list[str]]  # services of each new wave, sorted
+    wave_count: int
+    optimal: bool
+    assignment: dict[str, int]  # service -> 0-based wave position
+    max_concurrency: int  # effective cap after applying the changes
+    affected_services: list[str]  # referenced by newly added constraints
+
+
+def _apply_changes(
+    original: PlanCreate, changes: PlanSimulate
+) -> tuple[PlanCreate, list[str]]:
+    """Merge constraint changes into the stored request.
+
+    Returns the merged request plus the services directly referenced by the
+    *newly added* constraints. Removals must name constraints that exist in
+    the stored plan; adding a fault domain whose id is still in use is
+    rejected (remove it in the same request to replace it).
+    """
+    issues: list[Issue] = []
+
+    original_edges = {(d.service, d.depends_on) for d in original.dependencies}
+    remove_edges = {(d.service, d.depends_on) for d in changes.remove_dependencies}
+    for service, depends_on in sorted(remove_edges - original_edges):
+        issues.append(
+            Issue(
+                code="dependency_not_found",
+                message=(
+                    f"Cannot remove dependency '{service}' -> '{depends_on}': "
+                    "the stored plan has no such dependency."
+                ),
+                constraint="remove_dependencies",
+                service=service,
+                related_services=[depends_on],
+            )
+        )
+    add_edges = {(d.service, d.depends_on) for d in changes.add_dependencies}
+
+    original_domains = {fd.domain: fd.services for fd in original.fault_domains}
+    remove_domains = set(changes.remove_fault_domains)
+    for domain in sorted(remove_domains - set(original_domains)):
+        issues.append(
+            Issue(
+                code="fault_domain_not_found",
+                message=(
+                    f"Cannot remove fault domain '{domain}': the stored plan "
+                    "has no such domain."
+                ),
+                constraint="remove_fault_domains",
+                context={"domain": domain},
+            )
+        )
+    for fd in changes.add_fault_domains:
+        if fd.domain in original_domains and fd.domain not in remove_domains:
+            issues.append(
+                Issue(
+                    code="duplicate_fault_domain",
+                    message=(
+                        f"Fault domain '{fd.domain}' already exists in the "
+                        "stored plan; remove it in the same request to "
+                        "replace it."
+                    ),
+                    constraint="add_fault_domains",
+                    context={"domain": fd.domain},
+                )
+            )
+
+    if issues:
+        raise PlanningError(
+            "The simulation changes reference constraints that do not exist "
+            "or clash with the stored plan.",
+            issues,
+        )
+
+    merged_edges = sorted((original_edges - remove_edges) | add_edges)
+    merged = PlanCreate(
+        name=original.name,
+        services=list(original.services),
+        dependencies=[Dependency(service=s, depends_on=d) for s, d in merged_edges],
+        max_concurrency=(
+            changes.max_concurrency
+            if changes.max_concurrency is not None
+            else original.max_concurrency
+        ),
+        fault_domains=(
+            [
+                FaultDomain(domain=fd.domain, services=fd.services)
+                for fd in original.fault_domains
+                if fd.domain not in remove_domains
+            ]
+            + list(changes.add_fault_domains)
+        ),
+        # The stored release window is intentionally not applied: the
+        # simulation reports the resulting wave-count delta instead.
+        max_waves=None,
+    )
+
+    new_edges = add_edges - original_edges
+    affected = sorted(
+        {s for edge in new_edges for s in edge}
+        | {m for fd in changes.add_fault_domains for m in fd.services}
+    )
+    return merged, affected
+
+
+def _movement_indicators(
+    model: cp_model.CpModel,
+    pos: dict[str, cp_model.IntVar],
+    services: list[str],
+    original_pos: dict[str, int],
+) -> list[cp_model.IntVar]:
+    """One bool per service: 1 iff its wave differs from the stored plan."""
+    moved = []
+    for s in services:
+        b = model.NewBoolVar(f"moved_{s}")
+        model.Add(pos[s] != original_pos[s]).OnlyEnforceIf(b)
+        model.Add(pos[s] == original_pos[s]).OnlyEnforceIf(b.Not())
+        moved.append(b)
+    return moved
+
+
+def _solve_simulation(
+    services: list[str],
+    edges: list[tuple[str, str]],
+    fault_cliques: list[list[str]],
+    concurrency: int,
+    original_pos: dict[str, int],
+    settings: Settings,
+) -> _SolveResult:
+    """Minimize waves first, then the number of services that change wave.
+
+    One wave always costs more than moving every service, so the scaled
+    single objective ``max_pos * (n + 1) + moved`` is exactly lexicographic.
+    A second solve then canonicalizes placement among equally optimal
+    solutions (same wave count, same number of moved services), keeping the
+    result deterministic; see ``_solve``.
+    """
+    n = len(services)
+    model, pos, max_pos = _build_wave_model(
+        services, edges, fault_cliques, n, concurrency
+    )
+    moved = _movement_indicators(model, pos, services, original_pos)
+    total_moved = model.NewIntVar(0, n, "total_moved")
+    model.Add(total_moved == sum(moved))
+    model.Minimize(max_pos * (n + 1) + total_moved)
+    solver = _make_solver(settings)
+    status = solver.Solve(model)
+
+    if status not in FEASIBLE_STATUSES:
+        return _SolveResult(False, False, 0, {})
+
+    optimal = status == cp_model.OPTIMAL
+    wave_count = int(solver.Value(max_pos)) + 1
+    min_moved = int(solver.Value(total_moved))
+    assignment = {s: int(solver.Value(pos[s])) for s in services}
+
+    if optimal:
+        ranked = {s: rank for rank, s in enumerate(sorted(services))}
+        model2, pos2, max_pos2 = _build_wave_model(
+            services, edges, fault_cliques, n, concurrency
+        )
+        model2.Add(max_pos2 == wave_count - 1)
+        moved2 = _movement_indicators(model2, pos2, services, original_pos)
+        model2.Add(sum(moved2) == min_moved)
+        model2.Maximize(sum(ranked[s] * pos2[s] for s in services))
+        model2.AddHint(max_pos2, wave_count - 1)
+        for s, w in assignment.items():
+            model2.AddHint(pos2[s], w)
+        tie_break_budget = min(3.0, max(0.5, settings.solver_time_limit_seconds / 2))
+        solver2 = _make_solver(settings, time_limit=tie_break_budget)
+        status2 = solver2.Solve(model2)
+        if status2 in FEASIBLE_STATUSES:
+            assignment = {s: int(solver2.Value(pos2[s])) for s in services}
+
+    return _SolveResult(True, optimal, wave_count, assignment)
+
+
+def simulate_plan(
+    original: PlanCreate,
+    original_pos: dict[str, int],
+    changes: PlanSimulate,
+    settings: Settings,
+) -> SimulationOutput:
+    """Re-plan the stored request with constraint changes applied.
+
+    ``original_pos`` maps each service to its 0-based wave in the stored
+    plan. Nothing is persisted by the caller.
+    """
+    merged, affected = _apply_changes(original, changes)
+    services, edges, _domains, fault_cliques = _validate_request(merged)
+
+    adj = build_adjacency(services, edges)
+    cycles = find_cycles(services, adj, settings.max_reported_cycles)
+    if cycles:
+        raise _cycle_error(cycles)
+
+    result = _solve_simulation(
+        services,
+        edges,
+        fault_cliques,
+        merged.max_concurrency,
+        original_pos,
+        settings,
+    )
+    if not result.feasible:
+        # Defensive: without a wave window a DAG always admits waves of size 1.
+        raise RuntimeError("Unexpected solver infeasibility during simulation")
+
+    output = _to_output(result)
+    return SimulationOutput(
+        waves=output.waves,
+        wave_count=output.wave_count,
+        optimal=output.optimal,
+        assignment=result.assignment,
+        max_concurrency=merged.max_concurrency,
+        affected_services=affected,
+    )

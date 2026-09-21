@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from . import db
 from .config import Settings, load_settings
 from .errors import PlanningError
-from .planner import plan_release
+from .planner import plan_release, simulate_plan
 from .schemas import (
     ErrorBody,
     Issue,
@@ -20,7 +20,10 @@ from .schemas import (
     PlanDeleted,
     PlanList,
     PlanResult,
+    PlanSimulate,
+    PlanSimulation,
     PlanSummary,
+    ServiceWaveChange,
     Wave,
 )
 
@@ -35,11 +38,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Release Wave Planning API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Compute the minimum number of ordered release waves for a service "
         "dependency graph under per-wave concurrency caps and fault-domain "
-        "anti-affinity constraints (OR-Tools CP-SAT)."
+        "anti-affinity constraints (OR-Tools CP-SAT), and simulate the "
+        "impact of constraint changes on a stored plan."
     ),
     lifespan=lifespan,
 )
@@ -110,6 +114,22 @@ def _row_to_result(row: sqlite3.Row) -> PlanResult:
         optimal=bool(row["optimal"]),
         created_at=row["created_at"],
     )
+
+
+def _plan_not_found(plan_id: int) -> JSONResponse:
+    body = ErrorBody(
+        error="not_found",
+        message=f"Plan {plan_id} does not exist.",
+        issues=[
+            Issue(
+                code="plan_not_found",
+                message=f"Plan {plan_id} does not exist.",
+                constraint="plan_id",
+                context={"id": plan_id},
+            )
+        ],
+    ).model_dump()
+    return JSONResponse(status_code=404, content=body)
 
 
 # ---------------------------------------------------------------------------
@@ -202,19 +222,7 @@ def get_plan(
 ) -> PlanResult:
     row = db.fetch_plan(conn, plan_id)
     if row is None:
-        body = ErrorBody(
-            error="not_found",
-            message=f"Plan {plan_id} does not exist.",
-            issues=[
-                Issue(
-                    code="plan_not_found",
-                    message=f"Plan {plan_id} does not exist.",
-                    constraint="plan_id",
-                    context={"id": plan_id},
-                )
-            ],
-        ).model_dump()
-        return JSONResponse(status_code=404, content=body)  # type: ignore[return-value]
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
     return _row_to_result(row)
 
 
@@ -228,17 +236,58 @@ def delete_plan(
     plan_id: int, conn: sqlite3.Connection = Depends(db.get_db)
 ) -> PlanDeleted:
     if not db.delete_plan(conn, plan_id):
-        body = ErrorBody(
-            error="not_found",
-            message=f"Plan {plan_id} does not exist.",
-            issues=[
-                Issue(
-                    code="plan_not_found",
-                    message=f"Plan {plan_id} does not exist.",
-                    constraint="plan_id",
-                    context={"id": plan_id},
-                )
-            ],
-        ).model_dump()
-        return JSONResponse(status_code=404, content=body)  # type: ignore[return-value]
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
     return PlanDeleted(id=plan_id)
+
+
+@app.post(
+    "/plans/{plan_id}/simulate",
+    response_model=PlanSimulation,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def simulate_plan_changes(
+    plan_id: int,
+    payload: PlanSimulate,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> PlanSimulation:
+    """What-if re-planning with constraint changes; nothing is persisted."""
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    settings: Settings = app.state.settings
+    original = PlanCreate(**json.loads(row["request_json"]))
+    stored = json.loads(row["result_json"])
+    original_pos = {
+        service: wave["index"] - 1
+        for wave in stored["waves"]
+        for service in wave["services"]
+    }
+
+    result = simulate_plan(original, original_pos, payload, settings)
+
+    assignments = [
+        ServiceWaveChange(
+            service=service,
+            from_wave=original_pos[service] + 1,
+            to_wave=result.assignment[service] + 1,
+        )
+        for service in sorted(result.assignment)
+    ]
+    return PlanSimulation(
+        plan_id=row["id"],
+        name=row["name"],
+        waves=[
+            Wave(index=i + 1, services=members)
+            for i, members in enumerate(result.waves)
+        ],
+        wave_count=result.wave_count,
+        original_wave_count=row["wave_count"],
+        wave_delta=result.wave_count - row["wave_count"],
+        max_concurrency=result.max_concurrency,
+        optimal=result.optimal,
+        assignments=assignments,
+        moved_services=[a.service for a in assignments if a.from_wave != a.to_wave],
+        affected_services=result.affected_services,
+    )

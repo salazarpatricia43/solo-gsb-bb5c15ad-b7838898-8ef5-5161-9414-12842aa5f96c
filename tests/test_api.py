@@ -215,3 +215,294 @@ def test_schema_validation_error_envelope(client):
     body = r.json()
     assert body["error"] == "validation_error"
     assert body["issues"]
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/simulate
+# ---------------------------------------------------------------------------
+
+
+def _create_plan(client, payload=None):
+    r = client.post("/plans", json=payload or BASE_PAYLOAD)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_simulate_no_changes_reproduces_plan(client):
+    plan = _create_plan(client)
+    r = client.post(f"/plans/{plan['id']}/simulate", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["waves"] == plan["waves"]
+    assert body["wave_count"] == plan["wave_count"] == 3
+    assert body["original_wave_count"] == 3
+    assert body["wave_delta"] == 0
+    assert body["max_concurrency"] == plan["max_concurrency"]
+    assert body["optimal"] is True
+    assert body["moved_services"] == []
+    assert body["affected_services"] == []
+    by_service = {a["service"]: a for a in body["assignments"]}
+    assert by_service.keys() == {"a", "b", "c", "d"}
+    assert all(a["from_wave"] == a["to_wave"] for a in by_service.values())
+
+
+def test_simulate_stricter_concurrency_adds_wave(client):
+    plan = _create_plan(client)
+    r = client.post(f"/plans/{plan['id']}/simulate", json={"max_concurrency": 1})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 4
+    assert body["wave_delta"] == 1
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b"], ["c"], ["d"]]
+    assert body["moved_services"] == ["c", "d"]
+    assert body["max_concurrency"] == 1
+
+
+def test_simulate_looser_concurrency_removes_wave(client):
+    payload = dict(BASE_PAYLOAD, max_concurrency=1)
+    plan = _create_plan(client, payload)
+    assert plan["wave_count"] == 4
+    r = client.post(f"/plans/{plan['id']}/simulate", json={"max_concurrency": 4})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 3
+    assert body["wave_delta"] == -1
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b", "c"], ["d"]]
+    assert body["moved_services"] == ["c", "d"]
+
+
+def test_simulate_minimizes_moved_services(client):
+    # 5 independent services, cap 2 -> [[a], [b, c], [d, e]] (3 waves).
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c", "d", "e"], "max_concurrency": 2}
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a"], ["b", "c"], ["d", "e"]]
+
+    # Cap 3 needs only 2 waves; a fresh canonical plan would be
+    # [[a, b, c], [d, e]] (3 moves), but d and e are the only services that
+    # cannot keep their wave, so exactly they must move.
+    r = client.post(f"/plans/{plan['id']}/simulate", json={"max_concurrency": 3})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 2
+    assert body["wave_delta"] == -1
+    assert body["moved_services"] == ["d", "e"]
+    assert [w["services"] for w in body["waves"]] == [["a", "d"], ["b", "c", "e"]]
+    by_service = {a["service"]: a for a in body["assignments"]}
+    assert (by_service["d"]["from_wave"], by_service["d"]["to_wave"]) == (3, 1)
+    assert (by_service["e"]["from_wave"], by_service["e"]["to_wave"]) == (3, 2)
+
+
+def test_simulate_added_dependency_moves_dependent(client):
+    plan = _create_plan(client, {"services": ["a", "b"], "max_concurrency": 2})
+    assert [w["services"] for w in plan["waves"]] == [["a", "b"]]
+
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_dependencies": [{"service": "b", "depends_on": "a"}]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b"]]
+    assert body["wave_delta"] == 1
+    assert body["moved_services"] == ["b"]
+    assert body["affected_services"] == ["a", "b"]
+    by_service = {a["service"]: a for a in body["assignments"]}
+    assert (by_service["a"]["from_wave"], by_service["a"]["to_wave"]) == (1, 1)
+    assert (by_service["b"]["from_wave"], by_service["b"]["to_wave"]) == (1, 2)
+
+
+def test_simulate_removed_dependencies_allow_fewer_waves(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={
+            "remove_dependencies": [
+                {"service": "d", "depends_on": "b"},
+                {"service": "d", "depends_on": "c"},
+            ]
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b", "c", "d"]]
+    assert body["wave_delta"] == -1
+    assert body["moved_services"] == ["d"]
+    assert body["affected_services"] == []
+
+
+def test_simulate_added_fault_domain_splits_members(client):
+    plan = _create_plan(client, {"services": ["a", "b", "c"], "max_concurrency": 3})
+    assert [w["services"] for w in plan["waves"]] == [["a", "b", "c"]]
+
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_fault_domains": [{"domain": "az-1", "services": ["a", "b"]}]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [w["services"] for w in body["waves"]] == [["a", "c"], ["b"]]
+    assert body["wave_delta"] == 1
+    assert body["moved_services"] == ["b"]
+    assert body["affected_services"] == ["a", "b"]
+
+
+def test_simulate_replace_fault_domain_via_remove_and_add(client):
+    plan = _create_plan(
+        client,
+        {
+            "services": ["a", "b", "c"],
+            "max_concurrency": 3,
+            "fault_domains": [{"domain": "az-1", "services": ["a", "b"]}],
+        },
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a"], ["b", "c"]]
+
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={
+            "remove_fault_domains": ["az-1"],
+            "add_fault_domains": [{"domain": "az-1", "services": ["b", "c"]}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [w["services"] for w in body["waves"]] == [["a", "b"], ["c"]]
+    assert body["wave_delta"] == 0
+    assert body["moved_services"] == ["b"]
+    assert body["affected_services"] == ["b", "c"]
+
+
+def test_simulate_readding_existing_edge_is_noop(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_dependencies": [{"service": "b", "depends_on": "a"}]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_delta"] == 0
+    assert body["moved_services"] == []
+    assert body["affected_services"] == []
+
+
+def test_simulate_added_dependency_cycle_is_localized(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_dependencies": [{"service": "a", "depends_on": "d"}]},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "dependency_cycle"
+    assert issue["constraint"] == "dependencies"
+    assert issue["context"]["cycle_count"] >= 1
+
+
+def test_simulate_remove_unknown_dependency(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"remove_dependencies": [{"service": "a", "depends_on": "z"}]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "dependency_not_found"
+    assert issue["constraint"] == "remove_dependencies"
+    assert issue["service"] == "a"
+    assert issue["related_services"] == ["z"]
+
+
+def test_simulate_remove_unknown_fault_domain(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"remove_fault_domains": ["nope"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "fault_domain_not_found"
+    assert issue["constraint"] == "remove_fault_domains"
+    assert issue["context"]["domain"] == "nope"
+
+
+def test_simulate_add_duplicate_fault_domain(client):
+    plan = _create_plan(
+        client,
+        {
+            "services": ["a", "b", "c"],
+            "max_concurrency": 3,
+            "fault_domains": [{"domain": "az-1", "services": ["a", "b"]}],
+        },
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_fault_domains": [{"domain": "az-1", "services": ["a", "c"]}]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_fault_domain"
+    assert issue["constraint"] == "add_fault_domains"
+    assert issue["context"]["domain"] == "az-1"
+
+
+def test_simulate_unknown_references_are_localized(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_dependencies": [{"service": "a", "depends_on": "ghost"}]},
+    )
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert "unknown_dependency_target" in codes
+
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_fault_domains": [{"domain": "az-9", "services": ["a", "ghost"]}]},
+    )
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert "unknown_fault_domain_member" in codes
+
+
+def test_simulate_missing_plan_is_404(client):
+    r = client.post("/plans/9999/simulate", json={})
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_simulate_invalid_concurrency_is_validation_error(client):
+    plan = _create_plan(client)
+    r = client.post(f"/plans/{plan['id']}/simulate", json={"max_concurrency": 0})
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+
+def test_simulate_is_not_persisted(client):
+    plan = _create_plan(client)
+    before = client.get("/plans").json()["total"]
+
+    r = client.post(f"/plans/{plan['id']}/simulate", json={"max_concurrency": 1})
+    assert r.status_code == 200
+
+    assert client.get("/plans").json()["total"] == before
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+
+
+def test_simulate_is_deterministic(client):
+    plan = _create_plan(client)
+    payload = {
+        "max_concurrency": 2,
+        "add_dependencies": [{"service": "d", "depends_on": "a"}],
+        "add_fault_domains": [{"domain": "az-1", "services": ["b", "c"]}],
+    }
+    responses = [
+        client.post(f"/plans/{plan['id']}/simulate", json=payload).json()
+        for _ in range(3)
+    ]
+    assert responses[0] == responses[1] == responses[2]
